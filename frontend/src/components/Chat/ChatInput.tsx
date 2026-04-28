@@ -4,6 +4,11 @@ import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDropDownIcon from '@mui/icons-material/ArrowDropDown';
 import StopIcon from '@mui/icons-material/Stop';
 import { apiFetch } from '@/utils/api';
+import { useUserQuota } from '@/hooks/useUserQuota';
+import ClaudeCapDialog from '@/components/ClaudeCapDialog';
+import JobsUpgradeDialog from '@/components/JobsUpgradeDialog';
+import { useAgentStore } from '@/store/agentStore';
+import { CLAUDE_MODEL_PATH, FIRST_FREE_MODEL_PATH, isClaudePath } from '@/utils/model';
 
 // Model configuration
 interface ModelOption {
@@ -22,34 +27,34 @@ const getHfAvatarUrl = (modelId: string) => {
 
 const MODEL_OPTIONS: ModelOption[] = [
   {
+    id: 'kimi-k2.6',
+    name: 'Kimi K2.6',
+    description: 'Novita',
+    modelPath: 'moonshotai/Kimi-K2.6',
+    avatarUrl: getHfAvatarUrl('moonshotai/Kimi-K2.6'),
+    recommended: true,
+  },
+  {
     id: 'claude-opus',
     name: 'Claude Opus 4.6',
     description: 'Anthropic',
-    modelPath: 'anthropic/claude-opus-4-6',
+    modelPath: CLAUDE_MODEL_PATH,
     avatarUrl: 'https://huggingface.co/api/avatars/Anthropic',
     recommended: true,
   },
   {
-    id: 'minimax-m2.5',
-    name: 'MiniMax M2.5',
-    description: 'Via Fireworks',
-    modelPath: 'huggingface/fireworks-ai/MiniMaxAI/MiniMax-M2.5',
-    avatarUrl: getHfAvatarUrl('MiniMaxAI/MiniMax-M2.5'),
-    recommended: true,
+    id: 'minimax-m2.7',
+    name: 'MiniMax M2.7',
+    description: 'Novita',
+    modelPath: 'MiniMaxAI/MiniMax-M2.7',
+    avatarUrl: getHfAvatarUrl('MiniMaxAI/MiniMax-M2.7'),
   },
   {
-    id: 'kimi-k2.5',
-    name: 'Kimi K2.5',
-    description: 'Via Novita',
-    modelPath: 'huggingface/novita/moonshotai/kimi-k2.5',
-    avatarUrl: getHfAvatarUrl('moonshotai/Kimi-K2.5'),
-  },
-  {
-    id: 'glm-5',
-    name: 'GLM 5',
-    description: 'Via Novita',
-    modelPath: 'huggingface/novita/zai-org/glm-5',
-    avatarUrl: getHfAvatarUrl('zai-org/GLM-5'),
+    id: 'glm-5.1',
+    name: 'GLM 5.1',
+    description: 'Together',
+    modelPath: 'zai-org/GLM-5.1',
+    avatarUrl: getHfAvatarUrl('zai-org/GLM-5.1'),
   },
 ];
 
@@ -58,40 +63,53 @@ const findModelByPath = (path: string): ModelOption | undefined => {
 };
 
 interface ChatInputProps {
+  sessionId?: string;
   onSend: (text: string) => void;
   onStop?: () => void;
+  onDeclineBlockedJobs?: () => Promise<boolean>;
+  onContinueBlockedJobsWithNamespace?: (namespace: string) => Promise<boolean>;
   isProcessing?: boolean;
   disabled?: boolean;
   placeholder?: string;
 }
 
-export default function ChatInput({ onSend, onStop, isProcessing = false, disabled = false, placeholder = 'Ask anything...' }: ChatInputProps) {
+const isClaudeModel = (m: ModelOption) => isClaudePath(m.modelPath);
+const firstFreeModel = () => MODEL_OPTIONS.find(m => !isClaudeModel(m)) ?? MODEL_OPTIONS[0];
+
+export default function ChatInput({ sessionId, onSend, onStop, onDeclineBlockedJobs, onContinueBlockedJobsWithNamespace, isProcessing = false, disabled = false, placeholder = 'Ask anything...' }: ChatInputProps) {
   const [input, setInput] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const [selectedModelId, setSelectedModelId] = useState<string>(() => {
-    try {
-      const stored = localStorage.getItem('hf-agent-model');
-      if (stored && MODEL_OPTIONS.some(m => m.id === stored)) return stored;
-    } catch { /* localStorage unavailable */ }
-    return MODEL_OPTIONS[0].id;
-  });
+  const [selectedModelId, setSelectedModelId] = useState<string>(MODEL_OPTIONS[0].id);
   const [modelAnchorEl, setModelAnchorEl] = useState<null | HTMLElement>(null);
+  const { quota, refresh: refreshQuota } = useUserQuota();
+  // The daily-cap dialog is triggered from two places: (a) a 429 returned
+  // from the chat transport when the user tries to send on Opus over cap —
+  // surfaced via the agent-store flag — and (b) nothing else right now
+  // (switching models is free). Keeping the open state in the store means
+  // the hook layer can flip it without threading props through.
+  const claudeQuotaExhausted = useAgentStore((s) => s.claudeQuotaExhausted);
+  const setClaudeQuotaExhausted = useAgentStore((s) => s.setClaudeQuotaExhausted);
+  const jobsUpgradeRequired = useAgentStore((s) => s.jobsUpgradeRequired);
+  const setJobsUpgradeRequired = useAgentStore((s) => s.setJobsUpgradeRequired);
+  const lastSentRef = useRef<string>('');
 
-  // Sync with backend on mount (backend is source of truth, localStorage is just a cache)
+  // Model is per-session: fetch this tab's current model every time the
+  // session changes. Other tabs keep their own selections independently.
   useEffect(() => {
-    fetch('/api/config/model')
+    if (!sessionId) return;
+    let cancelled = false;
+    apiFetch(`/api/session/${sessionId}`)
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
-        if (data?.current) {
-          const model = findModelByPath(data.current);
-          if (model) {
-            setSelectedModelId(model.id);
-            try { localStorage.setItem('hf-agent-model', model.id); } catch { /* ignore */ }
-          }
+        if (cancelled) return;
+        if (data?.model) {
+          const model = findModelByPath(data.model);
+          if (model) setSelectedModelId(model.id);
         }
       })
       .catch(() => { /* ignore */ });
-  }, []);
+    return () => { cancelled = true; };
+  }, [sessionId]);
 
   const selectedModel = MODEL_OPTIONS.find(m => m.id === selectedModelId) || MODEL_OPTIONS[0];
 
@@ -104,10 +122,26 @@ export default function ChatInput({ onSend, onStop, isProcessing = false, disabl
 
   const handleSend = useCallback(() => {
     if (input.trim() && !disabled) {
+      lastSentRef.current = input;
       onSend(input);
       setInput('');
     }
   }, [input, disabled, onSend]);
+
+  // When the chat transport reports a Claude-quota 429, restore the typed
+  // text so the user doesn't lose their message.
+  useEffect(() => {
+    if (claudeQuotaExhausted && lastSentRef.current) {
+      setInput(lastSentRef.current);
+    }
+  }, [claudeQuotaExhausted]);
+
+  // Refresh the quota display whenever the session changes (user might
+  // have started another tab that spent quota).
+  useEffect(() => {
+    if (sessionId) refreshQuota();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLDivElement>) => {
@@ -129,17 +163,92 @@ export default function ChatInput({ onSend, onStop, isProcessing = false, disabl
 
   const handleSelectModel = async (model: ModelOption) => {
     handleModelClose();
+    if (!sessionId) return;
     try {
-      const res = await apiFetch('/api/config/model', {
+      const res = await apiFetch(`/api/session/${sessionId}/model`, {
         method: 'POST',
         body: JSON.stringify({ model: model.modelPath }),
       });
-      if (res.ok) {
-        setSelectedModelId(model.id);
-        try { localStorage.setItem('hf-agent-model', model.id); } catch { /* ignore */ }
-      }
+      if (res.ok) setSelectedModelId(model.id);
     } catch { /* ignore */ }
   };
+
+  // Dialog close: just clear the flag. The typed text is already restored.
+  const handleCapDialogClose = useCallback(() => {
+    setClaudeQuotaExhausted(false);
+  }, [setClaudeQuotaExhausted]);
+
+  // "Use a free model" — switch the current session to Kimi (or the first
+  // non-Anthropic option) and auto-retry the send that tripped the cap.
+  const handleUseFreeModel = useCallback(async () => {
+    setClaudeQuotaExhausted(false);
+    if (!sessionId) return;
+    const free = MODEL_OPTIONS.find(m => m.modelPath === FIRST_FREE_MODEL_PATH)
+      ?? firstFreeModel();
+    try {
+      const res = await apiFetch(`/api/session/${sessionId}/model`, {
+        method: 'POST',
+        body: JSON.stringify({ model: free.modelPath }),
+      });
+      if (res.ok) {
+        setSelectedModelId(free.id);
+        const retryText = lastSentRef.current;
+        if (retryText) {
+          onSend(retryText);
+          setInput('');
+          lastSentRef.current = '';
+        }
+      }
+    } catch { /* ignore */ }
+  }, [sessionId, onSend, setClaudeQuotaExhausted]);
+
+  const handleClaudeUpgradeClick = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      await apiFetch(`/api/pro-click/${sessionId}`, {
+        method: 'POST',
+        body: JSON.stringify({ source: 'claude_cap_dialog', target: 'pro_pricing' }),
+      });
+    } catch {
+      /* tracking is best-effort */
+    }
+  }, [sessionId]);
+
+  const handleJobsUpgradeClose = useCallback(() => {
+    setJobsUpgradeRequired(null);
+  }, [setJobsUpgradeRequired]);
+
+  const handleJobsUpgradeClick = useCallback(async () => {
+    if (!sessionId || !jobsUpgradeRequired) return;
+    try {
+      await apiFetch(`/api/pro-click/${sessionId}`, {
+        method: 'POST',
+        body: JSON.stringify({ source: 'hf_jobs_upgrade_dialog', target: 'pro_pricing' }),
+      });
+    } catch {
+      /* tracking is best-effort */
+    }
+  }, [sessionId, jobsUpgradeRequired]);
+
+  const handleDeclineBlockedJobs = useCallback(async () => {
+    if (!onDeclineBlockedJobs) return;
+    await onDeclineBlockedJobs();
+  }, [onDeclineBlockedJobs]);
+
+  const handleContinueBlockedJobsWithNamespace = useCallback(async (namespace: string) => {
+    if (!onContinueBlockedJobsWithNamespace) return;
+    await onContinueBlockedJobsWithNamespace(namespace);
+  }, [onContinueBlockedJobsWithNamespace]);
+
+  // Hide the chip until the user has actually burned quota — an unused
+  // Opus session shouldn't populate a counter.
+  const claudeChip = (() => {
+    if (!quota || quota.claudeUsedToday === 0) return null;
+    if (quota.plan === 'free') {
+      return quota.claudeRemaining > 0 ? 'Free today' : 'Pro only';
+    }
+    return `${quota.claudeUsedToday}/${quota.claudeDailyCap} today`;
+  })();
 
   return (
     <Box
@@ -339,6 +448,19 @@ export default function ChatInput({ onSend, onStop, isProcessing = false, disabl
                         }}
                       />
                     )}
+                    {isClaudeModel(model) && claudeChip && (
+                      <Chip
+                        label={claudeChip}
+                        size="small"
+                        sx={{
+                          height: '18px',
+                          fontSize: '10px',
+                          bgcolor: 'rgba(255,255,255,0.08)',
+                          color: 'var(--muted-text)',
+                          fontWeight: 600,
+                        }}
+                      />
+                    )}
                   </Box>
                 }
                 secondary={model.description}
@@ -349,6 +471,25 @@ export default function ChatInput({ onSend, onStop, isProcessing = false, disabl
             </MenuItem>
           ))}
         </Menu>
+
+        <ClaudeCapDialog
+          open={claudeQuotaExhausted}
+          plan={quota?.plan ?? 'free'}
+          cap={quota?.claudeDailyCap ?? 1}
+          onClose={handleCapDialogClose}
+          onUseFreeModel={handleUseFreeModel}
+          onUpgrade={handleClaudeUpgradeClick}
+        />
+        <JobsUpgradeDialog
+          open={!!jobsUpgradeRequired}
+          mode={jobsUpgradeRequired?.mode || 'upgrade'}
+          message={jobsUpgradeRequired?.message || ''}
+          eligibleNamespaces={jobsUpgradeRequired?.eligibleNamespaces || []}
+          onClose={handleJobsUpgradeClose}
+          onUpgrade={handleJobsUpgradeClick}
+          onDecline={handleDeclineBlockedJobs}
+          onContinueWithNamespace={handleContinueBlockedJobsWithNamespace}
+        />
       </Box>
     </Box>
   );

@@ -12,6 +12,7 @@ import { useChat } from '@ai-sdk/react';
 import { type UIMessage, lastAssistantMessageIsCompleteWithApprovalResponses } from 'ai';
 import { SSEChatTransport, type SideChannelCallbacks } from '@/lib/sse-chat-transport';
 import { loadMessages, saveMessages } from '@/lib/chat-message-store';
+import { saveBackendMessages } from '@/lib/backend-message-store';
 import { saveResearch, loadResearch, clearResearch, RESEARCH_MAX_STEPS } from '@/lib/research-store';
 import { llmMessagesToUIMessages } from '@/lib/convert-llm-messages';
 import { apiFetch } from '@/utils/api';
@@ -86,46 +87,63 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           useLayoutStore.getState().setRightPanelOpen(true);
         }
       },
-      onToolLog: (tool: string, log: string) => {
-        // Research sub-agent: parse stats vs step logs
+      onToolLog: (tool: string, log: string, agentId?: string, label?: string) => {
+        // Research sub-agent: parse stats vs step logs (per-agent)
         if (tool === 'research') {
+          const aid = agentId || 'research';
           const sessState = useAgentStore.getState().getSessionState(sessionId);
-          const stats = { ...sessState.researchStats };
+          const agents = { ...sessState.researchAgents };
+          const agent = agents[aid] || { label: label || 'research', steps: [], stats: { toolCount: 0, tokenCount: 0, startedAt: null, finalElapsed: null } };
 
           if (log === 'Starting research sub-agent...') {
-            const newStats = { toolCount: 0, tokenCount: 0, startedAt: Date.now(), finalElapsed: null };
+            agents[aid] = {
+              label: label || 'research',
+              steps: [],
+              stats: { toolCount: 0, tokenCount: 0, startedAt: Date.now(), finalElapsed: null },
+            };
+            // Also update legacy flat fields (aggregate of all agents)
+            const allSteps = Object.values(agents).flatMap(a => a.steps);
+            const anyRunning = Object.values(agents).some(a => a.stats.startedAt !== null);
             updateSession(sessionId, {
-              researchSteps: [],
-              researchStats: newStats,
-              activityStatus: { type: 'tool', toolName: 'research', description: log },
+              researchAgents: agents,
+              researchSteps: allSteps.slice(-RESEARCH_MAX_STEPS),
+              researchStats: anyRunning ? agents[aid].stats : sessState.researchStats,
+              activityStatus: { type: 'tool', toolName: 'research', description: label || log },
             });
-            saveResearch(sessionId, [], newStats);
+            saveResearch(sessionId, allSteps.slice(-RESEARCH_MAX_STEPS), agents[aid].stats);
           } else if (log.startsWith('tokens:')) {
-            stats.tokenCount = parseInt(log.slice(7), 10);
-            updateSession(sessionId, { researchStats: stats });
-            saveResearch(sessionId, sessState.researchSteps, stats);
+            agent.stats = { ...agent.stats, tokenCount: parseInt(log.slice(7), 10) };
+            agents[aid] = agent;
+            updateSession(sessionId, { researchAgents: agents });
           } else if (log.startsWith('tools:')) {
-            stats.toolCount = parseInt(log.slice(6), 10);
-            updateSession(sessionId, { researchStats: stats });
-            saveResearch(sessionId, sessState.researchSteps, stats);
+            agent.stats = { ...agent.stats, toolCount: parseInt(log.slice(6), 10) };
+            agents[aid] = agent;
+            updateSession(sessionId, { researchAgents: agents });
           } else if (log === 'Research complete.') {
-            const elapsed = stats.startedAt
-              ? Math.round((Date.now() - stats.startedAt) / 1000)
+            const elapsed = agent.stats.startedAt
+              ? Math.round((Date.now() - agent.stats.startedAt) / 1000)
               : null;
-            const doneStats = { ...stats, startedAt: null, finalElapsed: elapsed };
+            agent.stats = { ...agent.stats, startedAt: null, finalElapsed: elapsed };
+            agents[aid] = agent;
+            const anyRunning = Object.values(agents).some(a => a.stats.startedAt !== null);
             updateSession(sessionId, {
-              researchStats: doneStats,
+              researchAgents: agents,
+              researchStats: anyRunning ? sessState.researchStats : agent.stats,
               activityStatus: { type: 'tool', toolName: 'research', description: log },
             });
-            clearResearch(sessionId);
+            // Clear persistence only when ALL agents are done
+            if (!anyRunning) clearResearch(sessionId);
           } else {
-            // Regular tool call step — append (trim to max)
-            const steps = [...sessState.researchSteps, log].slice(-RESEARCH_MAX_STEPS);
+            // Regular tool call step — append to this agent
+            agent.steps = [...agent.steps, log].slice(-RESEARCH_MAX_STEPS);
+            agents[aid] = agent;
+            const allSteps = Object.values(agents).flatMap(a => a.steps);
             updateSession(sessionId, {
-              researchSteps: steps,
+              researchAgents: agents,
+              researchSteps: allSteps.slice(-RESEARCH_MAX_STEPS),
               activityStatus: { type: 'tool', toolName: 'research', description: log },
             });
-            saveResearch(sessionId, steps, stats);
+            saveResearch(sessionId, allSteps.slice(-RESEARCH_MAX_STEPS), agent.stats);
           }
           return;
         }
@@ -312,6 +330,49 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
     messages: UIMessage[];
   }>({ setMessages: null, messages: [] });
 
+  const hydrateFromBackend = useCallback(async () => {
+    try {
+      const [msgsRes, infoRes] = await Promise.all([
+        apiFetch(`/api/session/${sessionId}/messages`),
+        apiFetch(`/api/session/${sessionId}`),
+      ]);
+      if (!msgsRes.ok) return null;
+      const data = await msgsRes.json();
+      if (!Array.isArray(data) || data.length === 0) return null;
+
+      saveBackendMessages(sessionId, data);
+
+      let pendingIds: Set<string> | undefined;
+      let info: Record<string, unknown> | null = null;
+      if (infoRes.ok) {
+        info = await infoRes.json();
+        const pendingApproval = info?.pending_approval;
+        if (pendingApproval && Array.isArray(pendingApproval)) {
+          pendingIds = new Set(
+            pendingApproval.map((t: { tool_call_id: string }) => t.tool_call_id),
+          );
+          if (pendingIds.size > 0) {
+            setNeedsAttention(sessionId, true);
+          }
+        }
+      }
+
+      const uiMsgs = llmMessagesToUIMessages(data, pendingIds, chatActionsRef.current.messages);
+      if (uiMsgs.length > 0) {
+        chatActionsRef.current.setMessages?.(uiMsgs);
+        saveMessages(sessionId, uiMsgs);
+      }
+
+      if (pendingIds && pendingIds.size > 0) {
+        updateSession(sessionId, { activityStatus: { type: 'waiting-approval' }, isProcessing: false });
+      }
+
+      return { data, pendingIds, info };
+    } catch {
+      return null;
+    }
+  }, [sessionId, setNeedsAttention]);
+
   // -- useChat from Vercel AI SDK -----------------------------------------
   const chat = useChat({
     id: sessionId,
@@ -327,8 +388,93 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
     // sendMessages on the transport.
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
     onError: (error) => {
-      logger.error('useChat error:', error);
       updateSession(sessionId, { isProcessing: false });
+      // Claude daily-cap: open the cap dialog instead of the generic error
+      // banner. Transport marks the error with this sentinel.
+      if (error.message === 'CLAUDE_QUOTA_EXHAUSTED') {
+        if (isActiveRef.current) {
+          useAgentStore.getState().setClaudeQuotaExhausted(true);
+        }
+        return;
+      }
+      if (error.message === 'HF_JOBS_UPGRADE_REQUIRED') {
+        const typed = error as Error & {
+          detail?: Record<string, unknown>;
+          approvals?: Array<{
+            tool_call_id: string;
+            approved: boolean;
+            feedback?: string | null;
+            edited_script?: string | null;
+          }>;
+        };
+        void hydrateFromBackend();
+        if (isActiveRef.current) {
+          useAgentStore.getState().setJobsUpgradeRequired({
+            approvals: typed.approvals || [],
+            toolCallIds: (typed.detail?.tool_call_ids as string[]) || [],
+            message: String(
+              typed.detail?.message
+                || 'Hugging Face Jobs are available only to Pro users and Team or Enterprise organizations.',
+            ),
+            eligibleNamespaces: (typed.detail?.eligible_namespaces as string[]) || [],
+            plan: ((typed.detail?.plan as 'free' | 'pro' | 'org') || 'free'),
+            mode: 'upgrade',
+          });
+        }
+        return;
+      }
+      if (error.message === 'HF_JOBS_NAMESPACE_REQUIRED') {
+        const typed = error as Error & {
+          detail?: Record<string, unknown>;
+          approvals?: Array<{
+            tool_call_id: string;
+            approved: boolean;
+            feedback?: string | null;
+            edited_script?: string | null;
+            namespace?: string | null;
+          }>;
+        };
+        void hydrateFromBackend();
+        if (isActiveRef.current) {
+          useAgentStore.getState().setJobsUpgradeRequired({
+            approvals: typed.approvals || [],
+            toolCallIds: (typed.detail?.tool_call_ids as string[]) || [],
+            message: String(typed.detail?.message || 'Choose which organization should own this job run.'),
+            eligibleNamespaces: (typed.detail?.eligible_namespaces as string[]) || [],
+            plan: ((typed.detail?.plan as 'free' | 'pro' | 'org') || 'free'),
+            mode: 'namespace',
+          });
+        }
+        return;
+      }
+      if (error.message === 'HF_JOBS_INVALID_NAMESPACE') {
+        // Saved preference is no longer one of the user's eligible namespaces
+        // (e.g. they left the org). Clear it and reopen the picker.
+        const typed = error as Error & {
+          detail?: Record<string, unknown>;
+          approvals?: Array<{
+            tool_call_id: string;
+            approved: boolean;
+            feedback?: string | null;
+            edited_script?: string | null;
+            namespace?: string | null;
+          }>;
+        };
+        useAgentStore.getState().setPreferredJobsNamespace(null);
+        void hydrateFromBackend();
+        if (isActiveRef.current) {
+          useAgentStore.getState().setJobsUpgradeRequired({
+            approvals: typed.approvals || [],
+            toolCallIds: (typed.detail?.tool_call_ids as string[]) || [],
+            message: String(typed.detail?.message || 'Pick a different organization for this job run.'),
+            eligibleNamespaces: (typed.detail?.eligible_namespaces as string[]) || [],
+            plan: ((typed.detail?.plan as 'free' | 'pro' | 'org') || 'free'),
+            mode: 'namespace',
+          });
+        }
+        return;
+      }
+      logger.error('useChat error:', error);
       if (isActiveRef.current) {
         useAgentStore.getState().setError(error.message);
       }
@@ -350,6 +496,14 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         ]);
         if (cancelled) return;
 
+        // If both endpoints say "not found", the backend lost this session
+        // (typically: Space restarted). Fire onSessionDead so AppLayout
+        // can flag it for the catch-up banner.
+        if (infoRes.status === 404 && msgsRes.status === 404) {
+          callbacksRef.current.onSessionDead?.(sessionId);
+          return;
+        }
+
         let pendingIds: Set<string> | undefined;
         let backendIsProcessing = false;
         if (infoRes.ok) {
@@ -368,6 +522,9 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         if (msgsRes.ok) {
           const data = await msgsRes.json();
           if (cancelled || !Array.isArray(data) || data.length === 0) return;
+          // Cache the raw backend messages so we can restore this session
+          // into a fresh backend if the Space restarts.
+          saveBackendMessages(sessionId, data);
           const uiMsgs = llmMessagesToUIMessages(data, pendingIds, chatActionsRef.current.messages);
           if (uiMsgs.length > 0) {
             chat.setMessages(uiMsgs);
@@ -429,6 +586,10 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         if (!msgsRes.ok) return null;
         const data = await msgsRes.json();
         if (!Array.isArray(data) || data.length === 0) return null;
+
+        // Cache the raw backend messages so we can restore this session
+        // into a fresh backend if the Space restarts.
+        saveBackendMessages(sessionId, data);
 
         let pendingIds: Set<string> | undefined;
         if (infoRes.ok) {
@@ -631,11 +792,14 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
 
   // -- Approve tools ------------------------------------------------------
   const approveTools = useCallback(
-    async (approvals: Array<{ tool_call_id: string; approved: boolean; feedback?: string | null; edited_script?: string | null }>) => {
+    async (approvals: Array<{ tool_call_id: string; approved: boolean; feedback?: string | null; edited_script?: string | null; namespace?: string | null }>) => {
       // Store edited scripts so the transport can read them when sendMessages is called
       for (const a of approvals) {
         if (a.edited_script) {
           useAgentStore.getState().setEditedScript(a.tool_call_id, a.edited_script);
+        }
+        if (a.namespace) {
+          useAgentStore.getState().setApprovalNamespace(a.tool_call_id, a.namespace);
         }
       }
 
@@ -665,6 +829,40 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
     },
     [sessionId, chat, updateSession, setNeedsAttention],
   );
+
+  const declineBlockedJobs = useCallback(async () => {
+    const blocked = useAgentStore.getState().jobsUpgradeRequired;
+    if (!blocked) return false;
+
+    const approvals = blocked.approvals.map((approval) => ({
+      ...approval,
+      approved: blocked.toolCallIds.includes(approval.tool_call_id) ? false : approval.approved,
+      feedback: blocked.toolCallIds.includes(approval.tool_call_id)
+        ? 'Rejected because this account cannot launch Hugging Face Jobs.'
+        : approval.feedback,
+    }));
+
+    useAgentStore.getState().setJobsUpgradeRequired(null);
+    return approveTools(approvals);
+  }, [approveTools]);
+
+  const continueBlockedJobsWithNamespace = useCallback(async (namespace: string) => {
+    const blocked = useAgentStore.getState().jobsUpgradeRequired;
+    if (!blocked) return false;
+
+    const approvals = blocked.approvals.map((approval) => ({
+      ...approval,
+      namespace: blocked.toolCallIds.includes(approval.tool_call_id)
+        ? namespace
+        : approval.namespace,
+    }));
+
+    // Remember this choice so the picker doesn't reappear for every
+    // subsequent hf_jobs call.
+    useAgentStore.getState().setPreferredJobsNamespace(namespace);
+    useAgentStore.getState().setJobsUpgradeRequired(null);
+    return approveTools(approvals);
+  }, [approveTools]);
 
   // -- Stop (interrupt backend agent loop, keep SSE open for events) --------
   const stop = useCallback(() => {
@@ -722,5 +920,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
     undoLastTurn,
     editAndRegenerate,
     approveTools,
+    declineBlockedJobs,
+    continueBlockedJobsWithNamespace,
   };
 }

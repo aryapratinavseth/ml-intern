@@ -17,7 +17,9 @@ import httpx
 from huggingface_hub import HfApi
 from huggingface_hub.utils import HfHubHTTPError
 
+from agent.core.hf_access import JobsAccessError, resolve_jobs_namespace
 from agent.core.session import Event
+from agent.tools.trackio_seed import ensure_trackio_dashboard
 from agent.tools.types import ToolResult
 
 logger = logging.getLogger(__name__)
@@ -298,6 +300,7 @@ class HfJobsTool:
         self,
         hf_token: Optional[str] = None,
         namespace: Optional[str] = None,
+        jobs_access: Any = None,
         log_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         session: Any = None,
         tool_call_id: Optional[str] = None,
@@ -305,6 +308,7 @@ class HfJobsTool:
         self.hf_token = hf_token
         self.api = HfApi(token=hf_token)
         self.namespace = namespace
+        self.jobs_access = jobs_access
         self.log_callback = log_callback
         self.session = session
         self.tool_call_id = tool_call_id
@@ -378,6 +382,31 @@ class HfJobsTool:
                 "resultsShared": 0,
                 "isError": True,
             }
+
+    async def _seed_trackio_dashboard(self, space_id: str) -> None:
+        """Idempotently install trackio dashboard files into *space_id* before
+        the job runs. Surfaces seed progress as tool_log events but never
+        raises — a seed failure should not block job submission, since trackio
+        often still works when the Space already has dashboard code from a
+        previous run.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _log(msg: str) -> None:
+            if self.session is None:
+                return
+            loop.call_soon_threadsafe(
+                self.session.event_queue.put_nowait,
+                Event(event_type="tool_log", data={"tool": "hf_jobs", "log": msg}),
+            )
+
+        try:
+            await asyncio.to_thread(
+                ensure_trackio_dashboard, space_id, self.hf_token, _log
+            )
+        except Exception as e:
+            logger.warning(f"trackio dashboard seed failed for {space_id}: {e}")
+            _log(f"trackio dashboard seed failed: {e}")
 
     async def _wait_for_job_completion(
         self, job_id: str, namespace: Optional[str] = None
@@ -528,14 +557,29 @@ class HfJobsTool:
                 job_type = "Docker"
 
             # Run the job
+            flavor = args.get("hardware_flavor", "cpu-basic")
+            timeout_str = args.get("timeout", "30m")
+
+            # Trackio: agent-declared space + project become env vars on the job
+            # so trackio.init() picks them up automatically. We also surface them
+            # in tool_state_change so the frontend can embed the dashboard.
+            env_dict = _add_default_env(args.get("env"))
+            trackio_space_id = args.get("trackio_space_id")
+            trackio_project = args.get("trackio_project")
+            if trackio_space_id:
+                env_dict["TRACKIO_SPACE_ID"] = trackio_space_id
+                await self._seed_trackio_dashboard(trackio_space_id)
+            if trackio_project:
+                env_dict["TRACKIO_PROJECT"] = trackio_project
+
             job = await _async_call(
                 self.api.run_job,
                 image=image,
                 command=command,
-                env=_add_default_env(args.get("env")),
+                env=env_dict,
                 secrets=_add_environment_variables(args.get("secrets"), self.hf_token),
-                flavor=args.get("hardware_flavor", "cpu-basic"),
-                timeout=args.get("timeout", "30m"),
+                flavor=flavor,
+                timeout=timeout_str,
                 namespace=self.namespace,
             )
 
@@ -545,16 +589,28 @@ class HfJobsTool:
 
             # Send job URL immediately after job creation (before waiting for completion)
             if self.session and self.tool_call_id:
+                state_data: Dict[str, Any] = {
+                    "tool_call_id": self.tool_call_id,
+                    "tool": "hf_jobs",
+                    "state": "running",
+                    "jobUrl": job.url,
+                }
+                if trackio_space_id:
+                    state_data["trackioSpaceId"] = trackio_space_id
+                if trackio_project:
+                    state_data["trackioProject"] = trackio_project
                 await self.session.send_event(
-                    Event(
-                        event_type="tool_state_change",
-                        data={
-                            "tool_call_id": self.tool_call_id,
-                            "tool": "hf_jobs",
-                            "state": "running",
-                            "jobUrl": job.url,
-                        },
-                    )
+                    Event(event_type="tool_state_change", data=state_data)
+                )
+
+            # Telemetry: job submission + completion (infra consumption signal).
+            submit_ts = None
+            if self.session:
+                from agent.core import telemetry
+                submit_ts = await telemetry.record_hf_job_submit(
+                    self.session, job,
+                    {**args, "hardware_flavor": flavor, "timeout": timeout_str, "namespace": self.namespace},
+                    image=image, job_type=job_type,
                 )
 
             # Wait for completion and stream logs
@@ -566,22 +622,31 @@ class HfJobsTool:
                 namespace=self.namespace,
             )
 
+            if self.session and submit_ts is not None:
+                from agent.core import telemetry
+                await telemetry.record_hf_job_complete(
+                    self.session, job,
+                    flavor=flavor, final_status=final_status, submit_ts=submit_ts,
+                )
+
             # Untrack job ID (completed or failed, no longer needs cancellation)
             if self.session:
                 self.session._running_job_ids.discard(job.id)
 
             # Notify frontend of final status
             if self.session and self.tool_call_id:
+                final_data: Dict[str, Any] = {
+                    "tool_call_id": self.tool_call_id,
+                    "tool": "hf_jobs",
+                    "state": final_status.lower(),
+                    "jobUrl": job.url,
+                }
+                if trackio_space_id:
+                    final_data["trackioSpaceId"] = trackio_space_id
+                if trackio_project:
+                    final_data["trackioProject"] = trackio_project
                 await self.session.send_event(
-                    Event(
-                        event_type="tool_state_change",
-                        data={
-                            "tool_call_id": self.tool_call_id,
-                            "tool": "hf_jobs",
-                            "state": final_status.lower(),
-                            "jobUrl": job.url,
-                        },
-                    )
+                    Event(event_type="tool_state_change", data=final_data)
                 )
 
             # Filter out UV package installation output
@@ -955,7 +1020,10 @@ HF_JOBS_TOOL_SPEC = {
         "- You MUST have validated dataset format via hf_inspect_dataset or hub_repo_details.\n"
         "- Training config MUST include push_to_hub=True and hub_model_id. "
         "Job storage is EPHEMERAL — all files are deleted when the job ends. Without push_to_hub, trained models are lost permanently.\n"
-        "- Include trackio monitoring and provide the dashboard URL to the user.\n\n"
+        "- Include trackio monitoring and provide the dashboard URL to the user. "
+        "When the script uses report_to='trackio', also pass `trackio_space_id` "
+        "(e.g. '<username>/mlintern-<8char>') and `trackio_project` as tool args — "
+        "they are injected as TRACKIO_SPACE_ID/TRACKIO_PROJECT env vars and let the UI embed the live dashboard.\n\n"
         "BATCH/ABLATION JOBS: Submit ONE job first. Check logs to confirm it starts training successfully. "
         "Only then submit the remaining jobs. Never submit all at once — if there's a bug, all jobs fail.\n\n"
         "Operations: run, ps, logs, inspect, cancel, scheduled run/ps/inspect/delete/suspend/resume.\n\n"
@@ -1038,6 +1106,34 @@ HF_JOBS_TOOL_SPEC = {
                 "type": "object",
                 "description": "Environment variables {'KEY': 'VALUE'}. HF_TOKEN is auto-included.",
             },
+            "trackio_space_id": {
+                "type": "string",
+                "description": (
+                    "Optional. The HF Space hosting the trackio dashboard for this run "
+                    "(e.g. '<username>/mlintern-<8char>', under YOUR HF namespace). "
+                    "Injected as TRACKIO_SPACE_ID env var and used by the UI to embed "
+                    "the live dashboard. Set this whenever the script uses "
+                    "report_to='trackio'. The Space is auto-created and seeded with the "
+                    "trackio dashboard before the job starts — DO NOT pre-create it via "
+                    "hf_repo_git, that produces an empty Space that breaks the embed."
+                ),
+            },
+            "trackio_project": {
+                "type": "string",
+                "description": (
+                    "Optional. The trackio project name to log this run under. "
+                    "Injected as TRACKIO_PROJECT env var and used by the UI to filter "
+                    "the embedded dashboard to this project."
+                ),
+            },
+            "namespace": {
+                "type": "string",
+                "description": (
+                    "Optional namespace to run the job under. Must be your own Pro account "
+                    "or a paid org you belong to. If omitted, the tool prefers your personal "
+                    "account when eligible, otherwise the first eligible paid org."
+                ),
+            },
             "job_id": {
                 "type": "string",
                 "description": "Job ID. Required for: logs, inspect, cancel.",
@@ -1080,11 +1176,18 @@ async def hf_jobs_handler(
                 arguments = {**arguments, "script": content}
 
         hf_token = session.hf_token if session else None
-        namespace = os.environ.get("HF_NAMESPACE") or (HfApi(token=hf_token).whoami().get("name") if hf_token else None)
+        try:
+            namespace, jobs_access = await resolve_jobs_namespace(
+                hf_token or "",
+                arguments.get("namespace"),
+            )
+        except JobsAccessError as e:
+            return str(e), False
 
         tool = HfJobsTool(
             namespace=namespace,
             hf_token=hf_token,
+            jobs_access=jobs_access,
             log_callback=log_callback if session else None,
             session=session,
             tool_call_id=tool_call_id,

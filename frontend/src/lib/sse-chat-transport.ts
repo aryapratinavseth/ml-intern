@@ -23,7 +23,7 @@ export interface SideChannelCallbacks {
   onUndoComplete: () => void;
   onCompacted: (oldTokens: number, newTokens: number) => void;
   onPlanUpdate: (plan: Array<{ id: string; content: string; status: string }>) => void;
-  onToolLog: (tool: string, log: string) => void;
+  onToolLog: (tool: string, log: string, agentId?: string, label?: string) => void;
   onConnectionChange: (connected: boolean) => void;
   onSessionDead: (sessionId: string) => void;
   onApprovalRequired: (tools: Array<{ tool: string; arguments: Record<string, unknown>; tool_call_id: string }>) => void;
@@ -131,6 +131,8 @@ function createEventToChunkStream(sideChannel: SideChannelCallbacks): TransformS
           sideChannel.onToolLog(
             (event.data?.tool as string) || '',
             (event.data?.log as string) || '',
+            (event.data?.agent_id as string) || '',
+            (event.data?.label as string) || '',
           );
           break;
 
@@ -224,11 +226,16 @@ function createEventToChunkStream(sideChannel: SideChannelCallbacks): TransformS
           const state = (event.data?.state as string) || '';
           const toolName = (event.data?.tool as string) || '';
           const jobUrl = (event.data?.jobUrl as string) || undefined;
+          const trackioSpaceId = (event.data?.trackioSpaceId as string) || undefined;
+          const trackioProject = (event.data?.trackioProject as string) || undefined;
 
           if (tcId.startsWith('plan_tool')) break;
 
           if (jobUrl && tcId) {
             useAgentStore.getState().setJobUrl(tcId, jobUrl);
+          }
+          if (trackioSpaceId && tcId) {
+            useAgentStore.getState().setTrackioDashboard(tcId, trackioSpaceId, trackioProject);
           }
           if (state === 'running' && toolName) {
             sideChannel.onToolRunning(toolName);
@@ -318,11 +325,20 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
         const approved = p.approval?.approved ?? true;
         // Get edited script from agentStore if available
         const editedScript = useAgentStore.getState().getEditedScript(p.toolCallId);
+        const explicitNamespace = useAgentStore.getState().getApprovalNamespace(p.toolCallId);
+        // Fall back to the user's persisted choice so we don't re-prompt
+        // every hf_jobs call.  Backend will 400 if the saved namespace is
+        // no longer valid; the error handler clears the preference and
+        // reopens the picker.
+        const preferred = useAgentStore.getState().preferredJobsNamespace;
+        const namespace = explicitNamespace
+          ?? (approved && p.toolName === 'hf_jobs' ? preferred ?? null : null);
         return {
           tool_call_id: p.toolCallId,
           approved,
           feedback: approved ? null : (p.approval?.reason || 'Rejected by user'),
           edited_script: editedScript ?? null,
+          namespace: namespace ?? null,
         };
       }).filter(Boolean);
       body = { approvals };
@@ -349,6 +365,55 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
       },
     });
 
+    if (response.status === 404) {
+      // Backend lost this session (e.g. Space restart). Signal the UI so
+      // it can flag the session for the catch-up banner.
+      this.sideChannel.onSessionDead(sessionId);
+    }
+    if (response.status === 429) {
+      // Claude daily-quota gate tripped. The prefix is the detection marker
+      // for useAgentChat's onError handler, which surfaces the cap dialog
+      // instead of a generic error banner.
+      throw new Error('CLAUDE_QUOTA_EXHAUSTED');
+    }
+    if (response.status === 402) {
+      const payload = await response.json().catch(() => null);
+      if (payload?.detail?.error === 'hf_jobs_upgrade_required') {
+        const err = new Error('HF_JOBS_UPGRADE_REQUIRED') as Error & {
+          detail?: Record<string, unknown>;
+          approvals?: Array<Record<string, unknown>>;
+        };
+        err.detail = payload.detail as Record<string, unknown>;
+        err.approvals = (body.approvals as Array<Record<string, unknown>> | undefined) || [];
+        throw err;
+      }
+    }
+    if (response.status === 409) {
+      const payload = await response.json().catch(() => null);
+      if (payload?.detail?.error === 'hf_jobs_namespace_required') {
+        const err = new Error('HF_JOBS_NAMESPACE_REQUIRED') as Error & {
+          detail?: Record<string, unknown>;
+          approvals?: Array<Record<string, unknown>>;
+        };
+        err.detail = payload.detail as Record<string, unknown>;
+        err.approvals = (body.approvals as Array<Record<string, unknown>> | undefined) || [];
+        throw err;
+      }
+    }
+    if (response.status === 400) {
+      const payload = await response.json().catch(() => null);
+      if (payload?.detail?.error === 'hf_jobs_invalid_namespace') {
+        // Stored namespace is no longer eligible — surface so the UI can
+        // clear the saved preference and reopen the picker.
+        const err = new Error('HF_JOBS_INVALID_NAMESPACE') as Error & {
+          detail?: Record<string, unknown>;
+          approvals?: Array<Record<string, unknown>>;
+        };
+        err.detail = payload.detail as Record<string, unknown>;
+        err.approvals = (body.approvals as Array<Record<string, unknown>> | undefined) || [];
+        throw err;
+      }
+    }
     if (!response.ok) {
       const errorText = await response.text().catch(() => 'Request failed');
       throw new Error(`Chat request failed: ${response.status} ${errorText}`);
